@@ -1,8 +1,8 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { FontInfo } from '@/components/FontList';
 
-// Set up PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+// Set up PDF.js worker - use local worker file from public folder
+pdfjsLib.GlobalWorkerOptions.workerSrc = window.location.origin + "/pdf.worker.min.mjs";
 
 export async function extractFontsFromPDF(file: File): Promise<FontInfo[]> {
   try {
@@ -10,79 +10,105 @@ export async function extractFontsFromPDF(file: File): Promise<FontInfo[]> {
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     
     const fonts: FontInfo[] = [];
-    const fontSet = new Set<string>(); // To avoid duplicates
+    const fontSet = new Map<string, FontInfo>(); // Use Map to avoid duplicates and store full info
     
     // Iterate through all pages
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
-      const operatorList = await page.getOperatorList();
       
-      // Get font resources from the page
-      const pageDict = page.objs;
-      const resources = page.commonObjs;
-      
-      // Extract fonts from operator list
-      for (let i = 0; i < operatorList.fnArray.length; i++) {
-        const fn = operatorList.fnArray[i];
-        const args = operatorList.argsArray[i];
+      try {
+        // Get operator list to find font operations
+        const operatorList = await page.getOperatorList();
         
-        // Check for font operations
-        if (fn === pdfjsLib.OPS.setFont) {
-          const fontName = args[0];
+        // Look for font operations in the operator list
+        for (let i = 0; i < operatorList.fnArray.length; i++) {
+          const fn = operatorList.fnArray[i];
+          const args = operatorList.argsArray[i];
           
-          // Skip if we've already processed this font
-          if (fontSet.has(fontName)) continue;
-          fontSet.add(fontName);
-          
-          try {
-            // Try to get font information
-            const fontObj = await new Promise<any>((resolve, reject) => {
-              // Check page objects first
-              if (pageDict.has(fontName)) {
-                pageDict.get(fontName, resolve);
-              } else if (resources.has(fontName)) {
-                resources.get(fontName, resolve);
-              } else {
-                // If not found in objects, create a basic entry
-                resolve({ name: fontName, data: null });
-              }
-            });
+          // Check for font operations (setFont)
+          if (fn === pdfjsLib.OPS.setFont && args && args.length > 0) {
+            const fontName = args[0];
             
-            if (fontObj) {
-              // Extract font information
-              const fontInfo: FontInfo = {
-                name: fontObj.name || fontName,
-                type: fontObj.type || 'Unknown',
-                subtype: fontObj.subtype,
-                embedded: !!(fontObj.data || fontObj.file)
-              };
+            // Skip if we've already processed this font
+            if (fontSet.has(fontName)) continue;
+            
+            // Try to get font object from page resources
+            try {
+              const pageResources = page.objs;
+              const commonResources = page.commonObjs;
               
-              fonts.push(fontInfo);
+              // Try to get font information
+              let fontInfo: FontInfo | null = null;
+              
+              // Check if font is in page objects
+              if (pageResources && pageResources.has && pageResources.has(fontName)) {
+                const fontObj = await new Promise<any>((resolve, reject) => {
+                  const timeout = setTimeout(() => reject(new Error('Timeout')), 1000);
+                  pageResources.get(fontName, (obj: any) => {
+                    clearTimeout(timeout);
+                    resolve(obj);
+                  });
+                });
+                
+                if (fontObj) {
+                  fontInfo = {
+                    name: fontObj.name || fontName,
+                    type: fontObj.type || 'Unknown',
+                    subtype: fontObj.subtype,
+                    embedded: !!(fontObj.data || fontObj.file || fontObj.stream)
+                  };
+                }
+              }
+              
+              // Check common objects if not found in page objects
+              if (!fontInfo && commonResources && commonResources.has && commonResources.has(fontName)) {
+                const fontObj = await new Promise<any>((resolve, reject) => {
+                  const timeout = setTimeout(() => reject(new Error('Timeout')), 1000);
+                  commonResources.get(fontName, (obj: any) => {
+                    clearTimeout(timeout);
+                    resolve(obj);
+                  });
+                });
+                
+                if (fontObj) {
+                  fontInfo = {
+                    name: fontObj.name || fontName,
+                    type: fontObj.type || 'Unknown',
+                    subtype: fontObj.subtype,
+                    embedded: !!(fontObj.data || fontObj.file || fontObj.stream)
+                  };
+                }
+              }
+              
+              // If we couldn't get detailed info, create basic entry
+              if (!fontInfo) {
+                fontInfo = {
+                  name: fontName,
+                  type: 'Unknown',
+                  embedded: false
+                };
+              }
+              
+              fontSet.set(fontName, fontInfo);
+              
+            } catch (fontError) {
+              // If we can't get font details, add basic info
+              console.warn(`Could not get details for font ${fontName}:`, fontError);
+              fontSet.set(fontName, {
+                name: fontName,
+                type: 'Unknown',
+                embedded: false
+              });
             }
-          } catch (err) {
-            // If we can't get detailed info, add basic info
-            fonts.push({
-              name: fontName,
-              type: 'Unknown',
-              embedded: false
-            });
           }
         }
+      } catch (pageError) {
+        console.warn(`Error processing page ${pageNum}:`, pageError);
       }
     }
     
-    // Also try to get fonts from PDF metadata
-    try {
-      const metadata = await pdf.getMetadata();
-      // Additional font extraction from metadata if available
-    } catch (err) {
-      console.warn('Could not extract metadata:', err);
-    }
-    
-    // Remove duplicates based on name and sort
-    const uniqueFonts = fonts.filter((font, index, self) => 
-      index === self.findIndex(f => f.name === font.name)
-    );
+    // Convert Map values to array and sort
+    const uniqueFonts = Array.from(fontSet.values());
     
     return uniqueFonts.sort((a, b) => {
       // Sort embedded fonts first, then alphabetically
